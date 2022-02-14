@@ -69,6 +69,9 @@ class BaseDataset(Dataset):
         img_path = osp.join(self.img_dir, str(data.rel_path)).replace('\\', '/')
         img_path_rel = str(data.rel_path).replace('\\', '/')
         img = imread(img_path) / 255.0
+
+        label = int(img_path.split("/")[-2].split(".")[0])
+
         # Some are grayscale:
         if len(img.shape) == 2:
             img = np.repeat(np.expand_dims(img, 2), 3, axis=2)
@@ -127,7 +130,7 @@ class BaseDataset(Dataset):
             img2 = np.transpose(img2, (2, 0, 1))
             extra_res[res] = (img2, mask2)
 
-        return img_ref, kp_norm, mask_ref, sfm_pose_ref, mirrored, img_path_rel, extra_res
+        return img_ref, kp_norm, mask_ref, sfm_pose_ref, mirrored, img_path_rel, extra_res,label
 
     def normalize_kp(self, kp, sfm_pose, img_h, img_w):
         vis = kp[:, 2, None] > 0
@@ -191,7 +194,7 @@ class BaseDataset(Dataset):
         return self.num_imgs
 
     def __getitem__(self, index):
-        img, kp, mask, sfm_pose, mirrored, path, extra_res = self.forward_img(index)
+        img, kp, mask, sfm_pose, mirrored, path, extra_res,label = self.forward_img(index)
         sfm_pose[0].shape = 1
 
         elem = {
@@ -202,6 +205,7 @@ class BaseDataset(Dataset):
             'mirrored': mirrored,
             'inds': index,
             'path': path,
+            'label':label,
         }
         
         for res, img2 in extra_res.items():
