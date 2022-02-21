@@ -11,7 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from packaging import version
+
+from torch.nn import DataParallel
 
 try:
     from tqdm import tqdm
@@ -29,6 +30,8 @@ from rendering.mesh_template import MeshTemplate
 from utils.losses import loss_flat
 
 from models.reconstruction import ReconstructionNetwork, DatasetParams
+from models.classification_network import ClassificationNetwork
+from models.pnet import pointMLP
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--name', type=str, required=True)
@@ -64,8 +67,12 @@ parser.add_argument('--lr_dataset', type=float, default=0.0001)
 parser.add_argument('--lr_decay_every', type=int, default=250)
 parser.add_argument('--num_workers', type=int, default=4)
 
-args = parser.parse_args()
+parser.add_argument('--f', action='store_true')
+parser.add_argument('--pretrained_class_net', action='store_true')
+parser.add_argument('--use_texture', action='store_true')
+parser.add_argument('--use_pnet', action='store_true')
 
+args = parser.parse_args()
 
 if args.mesh_path == 'autodetect':
     if args.dataset == 'p3d':
@@ -149,11 +156,11 @@ if dataset_type == 'p3d':
     from cmr_data.p3d import P3dDataset
     
     cmr_ds_train = P3dDataset('train', is_train, dataloader_resolution)
-    mesh_ds_train = ImageDataset(cmr_ds_train, dataloader_resolution))
+    mesh_ds_train = ImageDataset(cmr_ds_train, dataloader_resolution)
     
     if not args.generate_pseudogt:
         cmr_ds_val = P3dDataset('val', False, dataloader_resolution_val)
-        mesh_ds_val = ImageDataset(cmr_ds_val, dataloader_resolution_val))
+        mesh_ds_val = ImageDataset(cmr_ds_val, dataloader_resolution_val)
     else:
         mesh_ds_val = None
     
@@ -254,10 +261,13 @@ def transform_vertices(vtx, gt_scale, gt_translation, gt_rot, gt_idx):
 def evaluate_all(loader, writer=None, it=0):
     with torch.no_grad():
         generator.eval()
+        classNet.eval()
         N = 0
         total_recon_loss = 0
         total_flat_loss = 0
+        total_class_loss = 0
         total_miou = 0
+        total_accuracy=0
         debug_images_real = []
         debug_images_fake = []
         debug_images_render = []
@@ -277,10 +287,14 @@ def evaluate_all(loader, writer=None, it=0):
             image_pred, alpha_pred = mesh_template.forward_renderer(renderer, vtx, pred_tex)
             X_fake = torch.cat((image_pred, alpha_pred), dim=3).permute(0, 3, 1, 2)
 
-            output = classNet(vtx) #vtx or raw_vt
+            if not args.use_texture:
+                output = classNet(vtx) #vtx or raw_vtx ?
+            else:
+                text_graph = mesh_template.get_texture_graph(pred_tex)
+                output = classNet(vtx,x=text_graph)
 
             class_loss = criterion_class(output,target)
-            acc = (output.argmax(dim=-1) == target).mean()
+            acc = (output.argmax(dim=-1) == target).float().mean()
 
             recon_loss = criterion(X_fake, X_real)
             flat_loss = loss_flat(mesh_template.mesh, mesh_template.compute_normals(raw_vtx))
@@ -317,10 +331,10 @@ def evaluate_all(loader, writer=None, it=0):
             writer.add_scalar(args.loss + '/val', total_recon_loss, it)
             writer.add_scalar('flat/val', total_flat_loss, it)
             writer.add_scalar('iou/val', total_miou, it)
-            writer.add_scalar('acc/train', total_accuracy.item(), total_it)
-            writer.add_scalar('class_loss/train', total_class_loss.item(), total_it)
+            writer.add_scalar('acc/val', total_accuracy.item(), total_it)
+            writer.add_scalar('class_loss/val', total_class_loss.item(), total_it)
 
-        log('[TEST] recon_loss {:.5f}, flat_loss {:.5f}, mIoU {:.5f}, total_accuracy{:,5f}, class_loss {:,5f}, N {}'.format(
+        log('[TEST] recon_loss {:.5f}, flat_loss {:.5f}, mIoU {:.5f}, total_accuracy{:.5f}, class_loss {:.5f}, N {}'.format(
                                                                 total_recon_loss, total_flat_loss,
                                                                 total_miou, total_accuracy,total_class_loss,N
                                                                 ))
@@ -347,7 +361,15 @@ generator = ReconstructionNetwork(symmetric=args.symmetric,
                                   mesh_res=args.mesh_resolution,
                                  ).cuda()
 
-classNet = ClassificationNetwork()
+generator.load_state_dict(torch.load("checkpoints_recon/pretrained_reconstruction_cub/checkpoint_latest.pth")["generator"])
+print("Loaded from checkpoints_recon/pretrained_reconstruction_cub/checkpoint_latest.pth")
+
+
+if args.use_pnet:
+    classNet = pointMLP(200,args.pretrained_class_net,args.use_texture).cuda()
+else:
+    classNet = ClassificationNetwork(200,args.pretrained_class_net,args.use_texture).cuda()
+classNet = DataParallel(classNet)
 
 optimizer = optim.Adam(classNet.parameters(), lr=args.lr)
 
@@ -437,25 +459,27 @@ try:
             if optimizer_dataset is not None:
                 optimizer_dataset.zero_grad()
 
-            pred_tex, mesh_map = generator(X_real)
-            raw_vtx = mesh_template.get_vertex_positions(mesh_map)
+            with torch.no_grad():
+                pred_tex, mesh_map = generator(X_real)
+                raw_vtx = mesh_template.get_vertex_positions(mesh_map)
+                vtx = transform_vertices(raw_vtx, gt_scale, gt_translation, gt_rot, gt_idx)
+                image_pred, alpha_pred = mesh_template.forward_renderer(renderer, vtx, pred_tex)
 
-            vtx = transform_vertices(raw_vtx, gt_scale, gt_translation, gt_rot, gt_idx)
+                X_fake = torch.cat((image_pred, alpha_pred), dim=3).permute(0, 3, 1, 2)
+                recon_loss = criterion(X_fake, X_real)
+                flat_loss = loss_flat(mesh_template.mesh, mesh_template.compute_normals(raw_vtx))
 
-            image_pred, alpha_pred = mesh_template.forward_renderer(renderer, vtx, pred_tex)
-            X_fake = torch.cat((image_pred, alpha_pred), dim=3).permute(0, 3, 1, 2)
-
-            recon_loss = criterion(X_fake, X_real)
-
-            output = classNet(vtx) #vtx or raw_vtx ?
+            if not args.use_texture:
+                output = classNet(vtx) #vtx or raw_vtx ?
+            else:
+                text_graph = mesh_template.get_texture_graph(pred_tex)
+                output = classNet(vtx,x=text_graph)
             class_loss = criterion_class(output,target)
             
-            flat_loss = loss_flat(mesh_template.mesh, mesh_template.compute_normals(raw_vtx))
-
             # Test losses
             with torch.no_grad():
                 miou = mean_iou(X_fake[:, 3], X_real[:, 3]) # Done on alpha channel
-                acc = (output.argmax(dim=-1) == target).mean()
+                acc = (output.argmax(dim=-1) == target).float().mean()
 
             flat_coeff = args.mesh_regularization*flat_warmup
             flat_warmup = max(flat_warmup - 0.1, 1)
@@ -469,10 +493,10 @@ try:
 
 
             if total_it % 10 == 0:
-                log('[{}] epoch {}, {}/{}, recon_loss {:.5f} flat_loss {:.5f} class_loss {:.5f} iou {:.5f}'.format(
+                log('[{}] epoch {}, {}/{}, recon_loss {:.5f} flat_loss {:.5f} class_loss {:.5f} acc {:.5f} iou {:.5f}'.format(
                                                                         total_it, epoch, i, len(train_loader),
                                                                         recon_loss.item(), flat_loss.item(),
-                                                                        loss.item(), miou.item(),
+                                                                        loss.item(), acc.item(),miou.item(),
                                                                         ))
 
             if args.tensorboard:

@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import math
-import os
+import os,sys
 
 from .utils import grid_sample_bilinear, circpad
 
@@ -127,31 +127,57 @@ class MeshTemplate:
         v2 = c - a
         normal = torch.cross(v1, v2, dim=2)
         return F.normalize(normal, dim=2)
+    
+    def preproc_and_grid_sample(self,displacement_map):
+            topo = self.nonneg_topo_map if self.is_symmetric else self.topo_map
+            #print("topo",topo.shape,self.topo_map.shape)         
+            _, displacement_map_padded = self.adjust_uv_and_texture(displacement_map)
+            if self.is_symmetric:
+                # Compensate for even symmetry in UV map
+                delta = 1/(2*displacement_map.shape[3])
+                expansion = (displacement_map.shape[3]+1)/displacement_map.shape[3]
+                topo = topo.clone()
+                topo[:, 0] = (topo[:, 0] + 1 + 2*delta - expansion)/expansion # Only for x axis
+            topo_expanded = topo.unsqueeze(0).unsqueeze(-2).expand(displacement_map.shape[0], -1, -1, -1)
+            vertex_deltas_local = grid_sample_bilinear(displacement_map_padded, topo_expanded).squeeze(-1).permute(0, 2, 1)
+            return vertex_deltas_local,displacement_map_padded,topo_expanded
+        
+    def get_texture_graph(self,text):
+        text_graph,_,_ = self.preproc_and_grid_sample(text)
+        text_graph = self.symetrize(text_graph)
+        return text_graph
+
+    def symetrize(self,vertex_deltas):
+        vtx_n = torch.Tensor(vertex_deltas.shape[0], self.topo_map.shape[0], 3).to(vertex_deltas.device)
+        #print("vtx_n",vtx_n.shape)
+        vtx_n[:, self.nonneg_indices] = vertex_deltas
+        vtx_n2 = vtx_n.clone()
+        vtx_n2[:, self.neg_indices] = vtx_n[:, self.pos_indices] * torch.Tensor([-1, 1, 1]).to(vtx_n.device)
+        vertex_deltas = vtx_n2 * self.symmetry_mask
+        return vertex_deltas
 
     def get_vertex_positions(self, displacement_map):
         """
         Deform this mesh template using the provided UV displacement map.
         Output: 3D vertex positions in object space.
         """
-        topo = self.nonneg_topo_map if self.is_symmetric else self.topo_map
-        _, displacement_map_padded = self.adjust_uv_and_texture(displacement_map)
-        if self.is_symmetric:
-            # Compensate for even symmetry in UV map
-            delta = 1/(2*displacement_map.shape[3])
-            expansion = (displacement_map.shape[3]+1)/displacement_map.shape[3]
-            topo = topo.clone()
-            topo[:, 0] = (topo[:, 0] + 1 + 2*delta - expansion)/expansion # Only for x axis
-        topo_expanded = topo.unsqueeze(0).unsqueeze(-2).expand(displacement_map.shape[0], -1, -1, -1)
-        vertex_deltas_local = grid_sample_bilinear(displacement_map_padded, topo_expanded).squeeze(-1).permute(0, 2, 1)
+
+        vertex_deltas_local,displacement_map_padded,topo_expanded = self.preproc_and_grid_sample(displacement_map)
+        
+        #print("vtx_del_local",vertex_deltas_local.shape)
+        #print("displacement_map_padded",displacement_map_padded.shape)
+        #print("topo_expanded",topo_expanded.shape)
         vertex_deltas = self.deform(vertex_deltas_local)
+        #print("vtx_del",vertex_deltas.shape)
         if self.is_symmetric:
+            #print("is symmetric")
             # Symmetrize
-            vtx_n = torch.Tensor(vertex_deltas.shape[0], self.topo_map.shape[0], 3).to(vertex_deltas.device)
-            vtx_n[:, self.nonneg_indices] = vertex_deltas
-            vtx_n2 = vtx_n.clone()
-            vtx_n2[:, self.neg_indices] = vtx_n[:, self.pos_indices] * torch.Tensor([-1, 1, 1]).to(vtx_n.device)
-            vertex_deltas = vtx_n2 * self.symmetry_mask
+            vertex_deltas = self.symetrize(vertex_deltas)
+            #print("vtx_deltas",vertex_deltas.shape)
+         
         vertex_positions = self.mesh.vertices.unsqueeze(0) + vertex_deltas
+        #print("Final",vertex_positions.shape,self.mesh.vertices.unsqueeze(0).shape,vertex_deltas.shape)   
+
         return vertex_positions
     
     def adjust_uv_and_texture(self, texture, return_texture=True):
