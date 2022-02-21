@@ -70,7 +70,7 @@ class BaseDataset(Dataset):
         img_path_rel = str(data.rel_path).replace('\\', '/')
         img = imread(img_path) / 255.0
 
-        label = int(img_path.split("/")[-2].split(".")[0])
+        label = int(img_path.split("/")[-2].split(".")[0])-1
 
         # Some are grayscale:
         if len(img.shape) == 2:
@@ -205,7 +205,7 @@ class BaseDataset(Dataset):
             'mirrored': mirrored,
             'inds': index,
             'path': path,
-            'label':label,
+            'target':label,
         }
         
         for res, img2 in extra_res.items():
